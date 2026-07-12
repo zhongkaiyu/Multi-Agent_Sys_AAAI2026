@@ -1,0 +1,182 @@
+\section{Discussion and Insights: Toward Graph Auto-Optimization}
+\label{sec:discussion_insights}
+
+The central thesis of this survey is that once an agentic workflow is made \emph{structurally visible} as a typed graph $G=(\mathcal{N},\mathcal{E},\mathrm{Op})$, it becomes an object that can be \emph{optimized}. Sections~\ref{sec:execution_level_opt}--\ref{sec:graph_level_optimizations} focused on optimizations that are largely hand-designed: we recognize motifs (fan-out, fan-in, cycles, star routing, tool interleaving) and map them to concrete system mechanisms (prefix caching, DAG-aware scheduling, disaggregation, proactive offload, etc.). This naturally raises a forward-looking question:
+
+\begin{quote}
+\emph{Can we automatically optimize the workflow graph itself, end-to-end, under explicit system objectives (latency, throughput, KV residency, I/O overlap) while preserving task quality?}
+\end{quote}
+
+This section outlines research directions toward \textbf{graph auto-optimization}: learning, searching, and compiling agent graphs in a way analogous to optimizing neural networks, but with typed operators, tool calls, and heterogeneous model backends.
+
+\subsection{Probabilistic and Differentiable Graphs}
+\label{sec:probabilistic_graphs}
+
+A key barrier to automated optimization is that agentic workflows are typically \emph{discrete}: edges represent hard routing decisions, and operators such as branching, voting, and early exits introduce non-differentiable control flow. A promising direction is to relax the graph into a \textbf{probabilistic execution model}. GPTSwarm takes an initial step by treating connectivity (which edges exist) as an optimizable object and learning edge configurations via reinforcement learning~\citep{zhuge2024gptswarm}. Generalizing this, we can attach a probability to each control edge, yielding a stochastic execution graph:
+\[
+p(e_{i\to j}\mid x, s) \in [0,1], \quad \sum_{j} p(e_{i\to j}\mid x, s)=1,
+\]
+where $x$ is the input query and $s$ is the current graph state (e.g., intermediate outputs, confidence signals, tool results). This probabilistic view enables three important capabilities.
+
+\paragraph{Expected-cost objective.}
+If each node $N_i$ has an estimated system cost (prefill FLOPs, decode tokens, KV bytes, tool latency), then the runtime objective becomes minimizing \emph{expected} cost:
+\[
+\min_{\theta}\; \mathbb{E}_{\pi_\theta(G)}\bigl[\; C_{\mathrm{sys}}(G, x) + \lambda \cdot C_{\mathrm{qual}}(G, x)\;\bigr],
+\]
+where $\pi_\theta$ parameterizes routing (edge probabilities), $C_{\mathrm{sys}}$ aggregates latency/throughput/memory objectives, and $C_{\mathrm{qual}}$ captures quality constraints (e.g., verifier score, downstream evaluation, preference reward). This naturally unifies ``graph-level'' restructuring with system-level resource management.
+
+\paragraph{Soft control operators.}
+Hard operators such as early exit $\mathrm{Op}_{\mathrm{exit}}$ and router selection $\mathrm{Op}_{\mathrm{route}}$ can be relaxed into \emph{gating functions} producing differentiable probabilities. In practice, the gating network can be a small model, a learned classifier, or a calibrated self-evaluation head. Even if the system ultimately executes a discrete path, training can use relaxation techniques (e.g., straight-through estimators, Gumbel-softmax), or policy-gradient methods when necessary.
+
+\paragraph{Uncertainty-aware compilation.}
+Once edges are probabilistic, the system can plan for \emph{expected} future execution. This directly connects to workflow-aware KV management (e.g., KVFlow): rather than prefetching only the next deterministic step, the system can prefetch KV pages proportional to transition probability, optimizing for expected latency under bounded GPU memory.
+
+\subsection{Treating Agent Graphs as Neural Networks}
+\label{sec:graph_as_nn}
+
+A complementary viewpoint is to treat agent graphs as \textbf{computational networks}, where each agent node behaves like a ``neuron'' (a parameterized function) and edges carry typed messages. Under this analogy, the design and optimization of workflows can borrow a rich toolbox from neural network optimization---but must be adapted to the unique properties of agent systems: discrete text messages, tool calls, and heterogeneous models. Several graph-level optimizations in Section~\ref{sec:graph_level_optimizations} admit a useful high-level analogy to neural network compression and architecture optimization. \textbf{Dropout} corresponds to stochastic \emph{subgraph dropout} that temporarily disables redundant parallel agents (e.g., in fan-out ensembles) to test whether accuracy is preserved; if so, the dropped agents become candidates for permanent pruning, mirroring Strategy~I (adaptive subgraph pruning). \textbf{Quantization} maps to \emph{node-level model downshifting}, where selected nodes replace $\mathcal{M}_{\text{large}}$ with smaller or cheaper backends while maintaining functional correctness, matching Strategy~II (heterogeneous node downscaling). \textbf{Distillation} aligns with compressing a multi-node subgraph (e.g., debate--synthesis) into a single stronger node by learning to imitate subgraph trajectories, reflecting Strategy~IV (subgraph consolidation). Finally, \textbf{architecture search} parallels workflow topology search---e.g., operator composition and control-edge design---as in AFlow-style automated workflow generation, but with serving-aware cost terms (KV residency, barrier slack, tool-induced stalls) treated as first-class constraints rather than post-hoc measurements.
+
+\paragraph{From analogies to parameterizations.}
+Neural network optimization becomes useful once the workflow is expressed as a set of tunable parameters
+subject to structural constraints.
+A practical parameterization for agent graphs includes:
+(i)~\textbf{edge gating} parameters that control conditional routing and activation,
+(ii)~\textbf{node backends} that select the model family (or tier) used at each node,
+(iii)~\textbf{operator thresholds} (e.g., early-exit confidence $\tau$, verifier strictness),
+and (iv)~\textbf{system-policy knobs} that affect execution (prefetch/offload aggressiveness, batching limits).
+Collect these into $\theta$ and view the workflow execution as sampling a subgraph and a schedule conditioned on
+$\theta$ and the input state.
+This turns auto-optimization into a constrained program optimization problem: adjust $\theta$ to minimize
+serving cost while satisfying task-quality constraints defined by verifiers or downstream evaluations
+(Section~\ref{sec:graph_level_optimizations}).
+
+% \paragraph{Credit assignment over nodes, edges, and operators.}
+% A core difference from standard neural networks is that workflow rewards are sparse and delayed:
+% quality is usually assessed only at the end of a multi-step run, while costs accrue at every node.
+% Auto-optimization therefore hinges on attributing outcomes to \emph{graph decisions}.
+% A promising direction is \textbf{counterfactual trace analysis}:
+% given an execution trace, replay locally modified traces that (i) disable one branch,
+% (ii) downgrade a single node backend, or (iii) tighten/loosen one operator threshold,
+% and estimate marginal changes in both cost and quality.
+% This yields node/edge ``influence scores'' that can drive targeted edits and reduce the search space
+% compared to global topology mutation.
+
+% \paragraph{Constrained optimization and regularization.}
+% Once decisions are parameterized, the workflow can be optimized under explicit constraints:
+% \[
+% \min_{\theta}\;\; \mathbb{E}\big[C_{\text{sys}}(\theta; x)\big]
+% \quad \text{s.t.}\quad
+% \mathbb{E}\big[C_{\text{qual}}(\theta; x)\big] \le \epsilon,\;\;
+% \theta \in \Omega_{\text{typed}}.
+% \]
+% Here $\Omega_{\text{typed}}$ encodes \emph{typed feasibility} (tool compatibility, schema constraints,
+% context-window bounds, and operator semantics).
+% Regularizers can bias solutions toward interpretable graphs, e.g.,
+% sparsity penalties that encourage fewer active branches, or stability penalties that discourage
+% large topology shifts between successive versions.
+% Compared to ad-hoc edits, this framing makes ``prune / downscale / consolidate'' emerge as solutions
+% to constrained objectives rather than hand-designed rules.
+
+% \paragraph{Stability, guardrails, and safe deployment.}
+% Unlike NN training, changing a workflow graph can silently degrade corner cases.
+% Auto-optimization should therefore be paired with \textbf{trust-region style updates}:
+% only allow bounded changes per iteration (e.g., limit the number of modified nodes/edges),
+% require canary evaluation on a held-out slice, and maintain an escalation fallback
+% that routes uncertain cases back to a known-safe workflow.
+% Typed operators are especially valuable here: they restrict the mutation space, preserve semantic intent,
+% and keep learned workflows controllable rather than opaque policies.
+
+% \paragraph{Dropout as stochastic agent pruning.}
+% In neural networks, dropout improves generalization by randomly dropping units during training. In agent graphs, an analogous operation is \textbf{stochastic subgraph dropout}: randomly disabling redundant or similarly functional parallel agents (e.g., multiple draft generators or parallel reasoners) during development and measuring whether quality degrades. If performance remains stable, these agents are candidates for permanent pruning or conditional activation. This provides a principled path toward reducing over-provisioned fan-out structures.
+
+% Concretely, for a parallel set $\{N_1,\ldots,N_K\}$ feeding an ensemble operator, define Bernoulli gates $z_k\sim\mathrm{Bernoulli}(p_k)$ and execute only $\{N_k: z_k=1\}$. The system learns $p_k$ to minimize cost while maintaining ensemble performance. When $p_k\to 0$, the corresponding agent is effectively removed.
+
+% \paragraph{Quantization as model downshifting.}
+% Model quantization reduces computation by lowering numerical precision. In agent graphs, the analogous knob is \textbf{node-level model downgrading}: replace $\mathcal{M}_{\mathrm{large}}$ at node $N_i$ with a smaller or cheaper model $\mathcal{M}_{\mathrm{small}}$ as long as it meets functional requirements. This is exactly the graph-level Strategy~II (Heterogeneous Node Downscaling), but the NN analogy suggests a systematic approach:
+% \begin{itemize}
+%   \item \textbf{Sensitivity analysis:} measure end-to-end quality impact when downgrading each node (one-at-a-time ablations), analogous to layer sensitivity in quantization-aware training.
+%   \item \textbf{Mixed-precision graphs:} treat the workflow as ``mixed precision,'' where only a few critical nodes retain the frontier model while others run SLMs, similar to keeping higher precision in sensitive layers.
+%   \item \textbf{Quantization-aware orchestration:} co-train routers/verifiers to compensate for weaker nodes by selectively escalating to stronger models (a workflow-level analog of error compensation).
+% \end{itemize}
+
+% \paragraph{Distillation as compressing subgraphs into nodes.}
+% Knowledge distillation compresses a large teacher network into a smaller student. In agent graphs, the teacher can be an entire \emph{subgraph} (e.g., debate + synthesis), and the student can be a single model invocation that imitates the subgraph's behavior. This aligns with Strategy~IV (Subgraph Consolidation) and suggests a training pipeline: collect trajectories and intermediate artifacts from the subgraph, then distill them into a single agent that reproduces outcomes with fewer orchestration steps.
+
+% \paragraph{Architecture search as workflow search under systems constraints.}
+% Neural architecture search (NAS) optimizes topology under compute budgets. Workflow generation methods (e.g., AFlow~\citep{zhang2024aflow}) are early analogs, but future work should treat \emph{systems constraints} as first-class: memory residency of KV, tool latency distributions, and cluster topology. This yields a workflow ``NAS'' problem where the cost model is not just token count but a serving-aware objective (prefill shock, barrier stragglers, offload overhead).
+
+\subsection{Serving-Aware Objectives and Cost Models}
+\label{sec:serving_aware_objectives}
+
+A major open problem is defining objective functions that are faithful to real deployments. Token-level proxies (e.g., total tokens) often mispredict performance in multi-agent settings due to KV residency, phase interference, synchronization barriers, and tool stalls. Graph formalization enables richer cost models:
+
+\begin{itemize}
+  \item \textbf{KV residency cost:} peak and integral of GPU KV memory over time, which directly limits batch size and thus throughput.
+  \item \textbf{Prefill shock penalty:} cost for concurrent prefills triggered by fan-out bursts, capturing decode starvation effects.
+  \item \textbf{Barrier-induced idle time:} slack at fan-in joins, capturing straggler amplification and wasted residency.
+  \item \textbf{Tool-induced dead-weight:} GPU memory held during tool calls, incentivizing proactive offload and asynchronous execution.
+\end{itemize}
+
+These costs are not merely additive; they depend on scheduling policy and cluster architecture. Thus, graph auto-optimization likely requires \textbf{co-optimization} of (i) workflow topology, (ii) execution policy (scheduling/offload/prefetch), and (iii) placement (which nodes run where).
+
+\subsection{Compilers and Runtimes for Graph Auto-Optimization}
+\label{sec:compilers_runtimes}
+
+To operationalize graph auto-optimization, we foresee a compiler--runtime stack that parallels modern deep learning compilers:
+
+\paragraph{(1) Graph Intermediate Representation with typed semantics.}
+A workflow intermediate representation must capture not only node/edge structure, but also:
+(i)~node backends (model ID, context constraints, parallelism),
+(ii)~edge types (c2g/g2c, payload sizes, serialization costs),
+(iii)~operator semantics (barriers, aggregation, conditional routing),
+and (iv)~state update rules (how context grows).
+
+\paragraph{(2) Correctness-by-construction rewrites with semantic contracts.}
+Rather than listing specific transformations (covered in Section~\ref{sec:graph_level_optimizations}),
+the compiler should expose a \emph{constrained rewrite space} whose rules come with
+(i) syntactic side-conditions (e.g., context-window feasibility, tool-schema compatibility),
+(ii) semantic contracts for operators $\text{Op}$ (e.g., barrier, aggregation, and routing semantics),
+and (iii) fast validators (lightweight verifiers, regression tests, or preference models).
+This enables a ``verify-then-apply'' pipeline: propose rewrites from pattern matches, check type/contract
+validity, estimate cost deltas from traces, and only then deploy under canary routing.
+
+\paragraph{(3) Profiling + feedback-driven optimization.}
+For complex tasks, correctness is empirical. The runtime should collect traces:
+per-node token counts, KV reuse rates, tool latency, and quality metrics.
+These traces define a graph ``training set'' for learning routers, gates, and consolidation policies. This closes the loop: workflows become optimizable programs whose execution yields data for future improvements.
+
+\paragraph{(4) Hybrid search: rules $\rightarrow$ learned gating $\rightarrow$ online adaptation.}
+A realistic path is staged:
+(i)~apply rule-based rewrites that yield immediate system wins,
+(ii)~learn probabilistic routing and node sizing offline from logs,
+(iii)~adapt online using contextual bandits or RL to track workload drift.
+
+\subsection{Open Challenges}
+\label{sec:open_challenges}
+
+Graph auto-optimization is promising but faces concrete obstacles:
+
+\begin{itemize}
+  \item \textbf{Quality constraints and evaluation cost.}
+  Unlike neural networks trained on static labels, agent workflows require expensive evaluation and may have non-stationary objectives. Efficient proxies (verifiers, preference models, self-consistency) and active evaluation are critical.
+
+  \item \textbf{Non-differentiability and tool effects.}
+  Tool calls introduce discontinuities, side effects, and heavy-tailed latency. Optimization must handle partial observability and stochastic execution time, likely requiring robust RL or conservative gating.
+
+  \item \textbf{Distribution shift and safety.}
+  Automated pruning or downscaling can silently break corner cases. Deployments need guardrails: canary routing, uncertainty-aware escalation, and rollback mechanisms.
+
+  \item \textbf{Multi-tenant interference.}
+  In shared clusters, per-workflow optimization can create negative externalities (e.g., bursty fan-out). Future objectives should be \emph{global}, incorporating fairness and cluster-level goodput.
+
+  \item \textbf{Interpretability and controllability.}
+  As workflows become learned objects, developers must retain semantic control. Typed operators and constrained rewrite spaces help preserve interpretability relative to opaque learned policies.
+
+  \item \textbf{Benchmarks and trace-driven calibration.}
+  To make serving-aware objectives actionable, future work needs shared evaluation artifacts:
+  (1) representative workflow graphs with typed operators and tool steps, (2) execution traces capturing
+  token counts, KV residency over time, tool latency distributions, and concurrency, and (3) task-specific
+  quality evaluators.
+  Such benchmark packages would allow cost models to be calibrated against real runtimes and enable
+  apples-to-apples comparison of auto-optimization methods across clusters, schedulers, and serving stacks.
+\end{itemize}

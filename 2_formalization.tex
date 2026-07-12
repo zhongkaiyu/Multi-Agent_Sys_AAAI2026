@@ -1,0 +1,141 @@
+% =========================
+% Section 2: Formalization (Workflow Graph)
+% =========================
+
+\section{Formalization: Unified Workflow Graph}
+\label{sec:formalization}
+
+We formalize an agentic workflow as a \emph{workflow graph} that exposes computation nodes, tool nodes, data dependencies, and orchestration operators as first-class objects. This makes opaque multi-step executions analyzable and optimizable at the systems level (e.g., KV reuse, scheduling, and graph rewrites). 
+
+\subsection{Workflow Graph}
+\label{subsec:wg}
+
+\paragraph{Definition.}
+A workflow is a directed graph
+\begin{equation}
+\label{eq:wg}
+G = (N, E, Op),
+\end{equation}
+where $N$ is a set of nodes, $E$ is a set of typed edges carrying dataflow/dependency information, and $Op$ is a set of graph operators/policies that govern control flow and aggregation.
+
+\subsection{Node set $N$ (node types)}
+\label{subsec:nodes}
+
+We distinguish two primary node families that cover most agentic systems:
+
+\paragraph{Computation nodes ($N_{\textsc{comp}}$).}
+A computation node represents model inference (e.g., LLM call) or an in-graph reasoning step.
+We represent a computation node as a triple:
+\begin{equation}
+\label{eq:ncomp}
+n \in N_{\textsc{comp}} \quad \Rightarrow \quad n := (M, P, C),
+\end{equation}
+where:
+\begin{itemize}
+    \item $M$: model (identifier, size, backend, etc.),
+    \item $P$: prompt (template + filled context),
+    \item $C$: config (decoding params, max tokens, stopping rules, etc.).
+\end{itemize}
+
+
+\paragraph{Tool nodes ($N_{\textsc{tool}}$).}
+A tool node represents an external capability call (i.e., not an LLM/model inference step). We keep this type intentionally
+open-ended and \emph{extendable}:
+\begin{equation}
+\label{eq:ntool}
+n \in N_{\textsc{tool}} \quad \Rightarrow \quad n := T,
+\end{equation}
+
+
+where $T$ is a tool identifier drawn from a growing tool set (depending on the framework/runtime), e.g.,
+\[
+\begin{aligned}
+T \in \{&
+\textsc{Compute}(\texttt{debug}),\ 
+\textsc{IO}(\texttt{file\_retrieval}),\ 
+\textsc{IO}(\texttt{read/write}),\\
+&\textsc{Network}(\texttt{web\_search}),\ 
+\textsc{Network}(\texttt{api\_call}),\ \ldots
+\}.
+\end{aligned}
+\]
+where \textsc{IO}(\texttt{file\_retrieval}) denotes an I/O-family tool for fetching files/documents (a specialization under \textsc{IO}),
+and \textsc{Network}(\texttt{web\_search}) denotes a network-family tool for retrieving external web evidence.
+
+\paragraph{Router nodes ($N_{\textsc{router}}$).}
+A router node performs \emph{conditional routing} by selecting a subset of downstream
+branches to activate based on the current workflow state.
+Analogous to a computation node, it is defined as a lightweight parameterized triple:
+\begin{equation}
+\label{eq:nrouter}
+n \in N_{\textsc{router}} \quad \Rightarrow \quad n := (R,\, P_r,\, C_r),
+\end{equation}
+where $R$ is a routing model or scoring function, $P_r$ is the routing prompt or feature
+specification, and $C_r$ is the routing configuration (e.g., top-$K$ selection,
+thresholding). The router emits a binary activation mask
+\begin{equation}
+\delta \;\in\; \{0,1\}^{|E_{\text{out}}|}, \qquad \|\delta\|_0 \;\le\; K,
+\end{equation}
+where $E_{\text{out}}$ denotes the set of outgoing edges from $n$.
+This mask is consumed by the downstream $Op_{\textsc{condition}}$ operator,
+which enables only the edges $e \in E_{\text{out}}$ for which $\delta_e = 1$,
+suppressing all other branches.
+
+
+
+\subsection{Edge set $E$ (typed dataflow / dependencies)}
+\label{subsec:edges}
+
+\paragraph{Definition.}
+An edge carries both connectivity and the \emph{data} (intermediate results / inputs / outputs) flowing along it:
+\begin{equation}
+\label{eq:edges}
+E \subseteq (N \times N \times \mathcal{D}),
+\end{equation}
+where $\mathcal{D}$ denotes the data payload (message text, retrieved passages, scores, structured JSON, etc.).
+Intuitively, an edge is not only “from $A$ to $B$”, but also “what $B$ receives from $A$”.
+
+\paragraph{Device-aware edge types.}
+To connect workflow structure with serving/runtime behaviors, we annotate edges with coarse transfer types:
+\begin{itemize}
+    \item $E_{\textsc{null}}$: no cross-device transfer (pure dependency / in-place),
+    \item $E_{\textsc{cpu}\rightarrow\textsc{gpu}}$ (c2g): CPU$\rightarrow$GPU transfer (e.g., prompt/context becomes prefill input),
+    \item $E_{\textsc{gpu}\rightarrow\textsc{cpu}}$ (g2c): GPU$\rightarrow$CPU transfer (e.g., generated outputs to controller/aggregator/tooling).
+\end{itemize}
+These annotations are lightweight but sufficient to express key systems pain points such as KV duplication,
+GPU memory residency during tool stalls, and barrier synchronization overheads.
+
+\subsection{Operator set $Op$ (graph operators / policies)}
+\label{subsec:ops}
+
+$Op$ captures control primitives that are \emph{not} just “another node,” but govern execution order, branching, looping, and aggregation.
+We highlight a core operator used throughout the paper:
+
+\paragraph{Ensemble / aggregation operator ($Op_{\textsc{ensemble}}$).}
+This merges multiple upstream results into one (e.g., majority vote, rerank, merge, debate synthesis):
+\[
+Op_{\textsc{ensemble}}: (d_1,\ldots,d_k) \mapsto d.
+\]
+It introduces a fan-in synchronization barrier: downstream execution depends on the last-arriving upstream branch.
+
+\paragraph{Conditional control operator ($Op_{\textsc{condition}}$).}
+This governs if/else, loops, early-stop, retries:
+\[
+Op_{\textsc{condition}}: (\mathcal{S}, d) \mapsto \{\text{next node(s)}\},
+\]
+where $\mathcal{S}$ is the workflow state (e.g., accumulated messages, confidence signals, tool outputs).
+This is the abstraction used later for early-exit pruning, adaptive routing, and difficulty-aware depth.
+
+% \subsection{Pattern (motif) as a subgraph}
+% \label{subsec:pattern}
+
+% A \textbf{pattern} is a reusable \emph{typed subgraph motif}:
+% \begin{equation}
+% \label{eq:pattern}
+% \mathcal{P} := (N_{\mathcal{P}}, E_{\mathcal{P}}, Op_{\mathcal{P}}) \quad \text{where } \mathcal{P} \subseteq G.
+% \end{equation}
+% Patterns let us map \emph{structure} to \emph{system optimization potential}:
+% e.g., Fan-out implies prefix redundancy (KV reuse opportunity),
+% Fan-in implies barrier tail latency (scheduling opportunity),
+% Tool-interleaving implies offload windows (memory opportunity),
+% and cycles imply temporal locality (pinning opportunity).
